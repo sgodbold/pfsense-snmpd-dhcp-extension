@@ -2,9 +2,7 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,13 +27,24 @@ type LeaseRaw struct {
 
 type Lease struct {
 	Ip       string `json:"ip""`
+	Fqdn string `json:"fqdn"`
 	Hostname string `json:"hostname"`
 	Mac      string `json:"mac"`
 }
 
+type Subnet struct {
+	Network string
+	Mask    string
+	Domain  string
+}
+
 const (
-	LeaseStartWord = "lease"
-	LeaseEndWord   = "}"
+	LeaseStartStatement = "lease"
+	LeaseEndWord    = "}"
+	SubnetStartStatement = "subnet"
+	SubnetEndWord   = "}"
+	DhcpdConfPath   = "/var/dhcpd/etc/dhcpd.conf"
+	DhcpdLeasesPath = "/var/dhcpd/var/db/dhcpd.leases"
 )
 
 func main() {
@@ -45,57 +54,42 @@ func main() {
 	}
 }
 
-func run(w io.Writer, args []string) error {
-	if len(args[1:]) < 1 {
-		return errors.New("incorrect number of arguments")
-	}
-
-	path := args[1]
-
-	file, err := os.Open(path)
+func run(w io.Writer, _ []string) error {
+	dlf, err := os.Open(DhcpdLeasesPath)
 	if err != nil {
-		return errors.New(
-			fmt.Sprintf("could not open file %s: %s", path, err))
+		return fmt.Errorf("could not open file %s: %s", DhcpdLeasesPath, err)
 	}
-	defer file.Close()
+	dlr := bufio.NewReader(dlf)
+	dls := bufio.NewScanner(dlr)
+	defer dlf.Close()
 
-	reader := bufio.NewReader(file)
-	writer := json.NewEncoder(w)
+	dcf, err := os.Open(DhcpdConfPath)
+	if err != nil {
+		return fmt.Errorf("could not open file %s: %s", DhcpdConfPath, err)
+	}
+	dcr := bufio.NewReader(dcf)
+	dcs := bufio.NewScanner(dcr)
+	defer dcf.Close()
 
-	leases, err := parseLeaseFile(reader)
+	subnets, err := parseConfigFile(dcs)
+	if err != nil {
+		return fmt.Errorf("could not parse config file: %s", err)
+	}
+
+	rawLeases, err := parseLeaseFile(dls)
 	if err != nil {
 		return err
 	}
 
-	printLeases(leases, writer)
+	writer := json.NewEncoder(w)
+	for _, rl := range(rawLeases) {
+		lease := buildLease(rl, subnets)
+		if lease != nil {
+		    writer.Encode(lease)
+		}
+	}
 
 	return nil
-}
-
-func parseLeaseFile(r *bufio.Reader) (map[string]*Lease, error) {
-	if err := parseHeader(r); err != nil {
-		return nil, errors.New(
-			fmt.Sprintf("could not consume header of leases file: %s", err))
-	}
-
-	leases := make(map[string]*Lease)
-
-	for {
-		raw, err := parseLease(r)
-		if err != nil {
-			return nil, err
-		}
-		if raw == nil {
-			break
-		}
-
-		if leaseFilter(raw) == false {
-			lease := leaseRawMap(raw)
-			leases[lease.Hostname] = lease
-		}
-	}
-
-	return leases, nil
 }
 
 func leaseFilter(l *LeaseRaw) bool {
@@ -112,300 +106,267 @@ func leaseFilter(l *LeaseRaw) bool {
 	return false
 }
 
-func leaseRawMap(l *LeaseRaw) *Lease {
-	pl := newPrintableLease()
+func buildLease(l *LeaseRaw, subnets []*Subnet) *Lease {
+	lease := Lease{}
 
-	pl.Ip = l.ip
-	pl.Mac = l.hardware
+	lease.Ip = l.ip
+	lease.Mac = l.hardware
 
 	if len(l.hostname) > 0 {
-		pl.Hostname = strings.ToLower(l.hostname)
+		lease.Hostname = strings.ToLower(l.hostname)
 	}
 	if len(l.clientHostname) > 0 {
-		pl.Hostname = strings.ToLower(l.clientHostname)
+		lease.Hostname = strings.ToLower(l.clientHostname)
 	}
 
-	return pl
+	var match *Subnet
+	for _, s := range subnets {
+		if subnetContainsIp(l.ip, s) {
+			match = s
+		}
+	}
+
+	if match == nil || len(match.Domain) <= 0 {
+		return nil
+	}
+
+	lease.Fqdn = fmt.Sprintf("%s.%s", lease.Hostname, match.Domain)
+
+	return &lease
+}
+
+func subnetContainsIp(ip string, subnet *Subnet) bool {
+	ipOctets := strings.Split(ip, ".")
+	netOctets := strings.Split(subnet.Network, ".")
+	maskOctets := strings.Split(subnet.Mask, ".")
+
+	for i, _ := range ipOctets {
+		// NOTE: only supporting whole octet masks for now
+		if strings.Compare(maskOctets[i], "255") != 0 {
+			continue
+		}
+
+		if strings.Compare(ipOctets[i], netOctets[i]) != 0 {
+			return false
+		}
+	}
+
+	return true
 }
 
 func newLeaseRaw() *LeaseRaw {
 	return &LeaseRaw{}
 }
 
-func newPrintableLease() *Lease {
-	return &Lease{}
+func newSubnet() *Subnet {
+	return &Subnet{}
 }
 
-func printLeases(leases map[string]*Lease, w *json.Encoder) {
-	for _, l := range leases {
-		w.Encode(l)
-	}
-}
-
-func parseHeader(r *bufio.Reader) error {
-	for {
-		if eq, _ := peekEq(LeaseStartWord, r); eq {
-			return nil
-		}
-
-		if _, err := r.ReadString('\n'); err != nil {
-			return errors.New("failed to find end of header")
-		}
-	}
-}
-
-func parseLease(r *bufio.Reader) (*LeaseRaw, error) {
-	l := newLeaseRaw()
+func parseConfigFile(s *bufio.Scanner) ([]*Subnet, error) {
+	var subnets []*Subnet
 
 	for {
-		eq, err := peekEq(LeaseEndWord, r)
-
-		if err != nil {
-			// can't peek because EOF
-			return nil, nil
-		}
-
-		if eq {
-			if _, err := r.ReadString('\n'); err != nil {
-				return nil, err
-			}
-			return l, nil
-		}
-
-		word, err := readWord(r)
+		subnet, err := parseSubnet(s)
 		if err != nil {
 			return nil, err
 		}
 
-		switch word {
-		case "lease":
-			ip, err := parseIp(r)
-			if err != nil {
-				return nil, err
-			}
-			l.ip = ip
-		case "hostname":
-			hostname, err := parseHostname(r)
-			if err != nil {
-				return nil, err
-			}
-			l.hostname = hostname
-		case "starts":
-			starts, err := parseTimeUtc(r)
-			if err != nil {
-				return nil, err
-			}
-			l.starts = starts
-		case "ends":
-			ends, err := parseTimeUtc(r)
-			if err != nil {
-				return nil, err
-			}
-			l.ends = ends
-		case "tstp":
-			tstp, err := parseTimeUtc(r)
-			if err != nil {
-				return nil, err
-			}
-			l.tstp = tstp
-		case "cltt":
-			cltt, err := parseTimeUtc(r)
-			if err != nil {
-				return nil, err
-			}
-			l.cltt = cltt
-		case "binding":
-			binding, err := parseBinding(r)
-			if err != nil {
-				return nil, err
-			}
-			l.binding = binding
-		case "uid":
-			uid, err := parseUid(r)
-			if err != nil {
-				return nil, err
-			}
-			l.uid = uid
-		case "hardware":
-			mac, err := parseHardware(r)
-			if err != nil {
-				return nil, err
-			}
-			l.hardware = mac
-		case "set":
-			// not implemented
-		case "client-hostname":
-			ch, err := parseClientHostname(r)
-			if err != nil {
-				return nil, err
-			}
-			l.clientHostname = ch
-		case "next":
-			next, err := parseNext(r)
-			if err != nil {
-				return nil, err
-			}
-			l.next = next
-		case "rewind":
-			rewind, err := parseRewind(r)
-			if err != nil {
-				return nil, err
-			}
-			l.rewind = rewind
-		default:
-			line, _ := r.ReadString('\n')
-			return nil, errors.New(
-				fmt.Sprintf("no parser for word %s\n%s", word, line))
+		if subnet == nil {
+			break
 		}
 
-		_, err = r.ReadString('\n')
-		if err != nil {
+		subnets = append(subnets, subnet)
+	}
+
+	return subnets, nil
+}
+
+func parseSubnet(s *bufio.Scanner) (*Subnet, error) {
+	inSubnetBlock := false
+	subnet := newSubnet()
+	var line string
+
+	for s.Scan() {
+		line = s.Text()
+
+		if strings.HasPrefix(line, SubnetStartStatement) {
+			inSubnetBlock = true
+		}
+		if !inSubnetBlock {
+			continue
+		}
+		if strings.HasPrefix(line, SubnetEndWord) {
+			return subnet, nil
+		}
+		if strings.Compare(line, "") == 0 {
+			continue
+		}
+
+		sl := strings.Split(strings.Trim(line, "\t ;"), " ")
+
+		if err := parseSubnetLine(sl, subnet); err != nil {
 			return nil, err
 		}
 	}
 
-	return l, nil
+	if err := s.Err(); err != nil {
+		return nil, err
+	}
+
+	return nil, nil
 }
 
-func parseIp(r *bufio.Reader) (string, error) {
-	ip, err := readWord(r)
-	if err != nil {
-		return "", errors.New(
-			fmt.Sprintf("failed to read ip: %s", err))
+func parseSubnetLine(sl []string, subnet *Subnet) error {
+	if len(sl) == 0 {
+		return nil
 	}
-	return ip, nil
+
+	stmt := sl[0]
+
+	switch stmt {
+	case "subnet":
+		subnet.Network = sl[1]
+		subnet.Mask = sl[3]
+	case "option":
+		if len(sl) == 3 && sl[0] == "option" && sl[1] == "domain-name" {
+			subnet.Domain = strings.Trim(sl[2], "\";")
+		}
+	case "ping-check":
+		// not implemented
+	case "pool":
+		// not implemented
+	case "range":
+		// not implemented
+	case "}":
+		// no-op
+	default:
+		return fmt.Errorf("skipping subnet statement with no configured parser '%s'\n%s",
+			stmt, strings.Join(sl, ","))
+	}
+
+	return nil
 }
 
-func parseHostname(r *bufio.Reader) (string, error) {
-	hostname, err := readWord(r)
-	if err != nil {
-		return "", errors.New(
-			fmt.Sprintf("failed to read hostname: %s", err))
+func parseLeaseFile(s *bufio.Scanner) (map[string]*LeaseRaw, error) {
+	leases := make(map[string]*LeaseRaw)
+
+	for {
+		raw, err := parseLease(s)
+		if err != nil {
+			return nil, err
+		}
+		if raw == nil {
+			break
+		}
+
+		if !leaseFilter(raw) {
+			leases[raw.ip] = raw
+		}
 	}
-	return hostname, nil
+
+	return leases, nil
+}
+func parseLease(s *bufio.Scanner) (*LeaseRaw, error) {
+	inLeaseBlock := false
+	lease := newLeaseRaw()
+	var line string
+
+	for s.Scan() {
+		line = s.Text()
+
+		if strings.HasPrefix(line, LeaseStartStatement) {
+			inLeaseBlock = true
+		}
+		if !inLeaseBlock {
+			continue
+		}
+		if strings.HasPrefix(line, LeaseEndWord) {
+			return lease, nil
+		}
+
+		ll := strings.Split(strings.Trim(line, " "), " ")
+		if err := parseLeaseLine(ll, lease); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := s.Err(); err != nil {
+		return nil, err
+	}
+
+	return nil, nil
 }
 
-func parseTimeUtc(r *bufio.Reader) (time.Time, error) {
-	// parse day of week; unused
-	if _, err := readWord(r); err != nil {
-		return time.Now(), err
+func parseLeaseLine(ll []string, lease *LeaseRaw) error {
+	if len(ll) == 0 {
+		return nil
 	}
-	line, err := r.ReadString(';')
-	if err != nil {
-		return time.Now(), err
+
+	stmt := ll[0]
+
+	switch stmt {
+	case "lease":
+		lease.ip = ll[1]
+	case "hostname":
+		lease.hostname = strings.Trim(ll[1], "\";")
+	case "starts":
+		date := ll[2]
+		time := strings.TrimRight(ll[3], ";")
+		datetime, err := parseTimeUtc(date, time)
+		if err != nil {
+			return err
+		}
+		lease.starts = datetime
+	case "ends":
+		date := ll[2]
+		time := strings.TrimRight(ll[3], ";")
+		datetime, err := parseTimeUtc(date, time)
+		if err != nil {
+			return err
+		}
+		lease.ends = datetime
+	case "tstp":
+		date := ll[2]
+		time := strings.TrimRight(ll[3], ";")
+		datetime, err := parseTimeUtc(date, time)
+		if err != nil {
+			return err
+		}
+		lease.tstp = datetime
+	case "cltt":
+		date := ll[2]
+		time := strings.TrimRight(ll[3], ";")
+		datetime, err := parseTimeUtc(date, time)
+		if err != nil {
+			return err
+		}
+		lease.cltt = datetime
+	case "binding":
+		lease.binding = strings.TrimRight(ll[2], ";")
+	case "uid":
+		lease.uid = strings.Trim(ll[1], "\";")
+	case "hardware":
+		lease.hardware = strings.TrimRight(ll[2], ";")
+	case "set":
+		// not implemented
+	case "client-hostname":
+		lease.clientHostname = strings.Trim(ll[1], "\";")
+	case "next":
+	case "rewind":
+		lease.rewind = strings.TrimRight(ll[3], ";")
+	default:
+		return fmt.Errorf("skipping statement with no configured parser %s\n%s",
+			stmt, strings.Join(ll, ","))
 	}
-	trimmed := strings.Trim(line, ";")
-	t, err := time.Parse("2006/01/02 15:04:05", trimmed)
+
+	return nil
+}
+
+func parseTimeUtc(rawdate string, rawtime string) (time.Time, error) {
+	s := fmt.Sprintf("%s %s", rawdate, rawtime)
+	t, err := time.Parse("2006/01/02 15:04:05", s)
 	if err != nil {
 		return time.Now(), err
 	}
 	return t, nil
-}
-
-func parseBinding(r *bufio.Reader) (string, error) {
-	// reads 'state'; unused
-	if _, err := readWord(r); err != nil {
-		return "", err
-	}
-	word, err := r.ReadString(';')
-	if err != nil {
-		return "", err
-	}
-	trimmed := strings.Trim(word, ";")
-	return trimmed, nil
-}
-
-func parseUid(r *bufio.Reader) (string, error) {
-	word, err := r.ReadString(';')
-	if err != nil {
-		return "", errors.New(
-			fmt.Sprintf("failed to read UID: %s", err))
-	}
-	trimmed := strings.Trim(word, "\";")
-	return trimmed, nil
-}
-
-func parseHardware(r *bufio.Reader) (string, error) {
-	// read hardware-type; unused
-	if _, err := readWord(r); err != nil {
-		return "", err
-	}
-	word, err := r.ReadString(';')
-	if err != nil {
-		return "", errors.New(
-			fmt.Sprintf("failed to read hardware: %s", err))
-	}
-	trimmed := strings.Trim(word, ";")
-	return trimmed, nil
-}
-
-func parseClientHostname(r *bufio.Reader) (string, error) {
-	word, err := r.ReadString(';')
-	if err != nil {
-		return "", errors.New(
-			fmt.Sprintf("failed to read client-hostname: %s", err))
-	}
-	trimmed := strings.Trim(word, "\";")
-	return trimmed, nil
-}
-
-func parseNext(r *bufio.Reader) (string, error) {
-	// read binding; unused
-	if _, err := readWord(r); err != nil {
-		return "", err
-	}
-	// read state; unused
-	if _, err := readWord(r); err != nil {
-		return "", err
-	}
-	word, err := r.ReadString(';')
-	if err != nil {
-		return "", errors.New(fmt.Sprintf("failed to read next: %s", err))
-	}
-	trimmed := strings.Trim(word, ";")
-	return trimmed, nil
-}
-
-func parseRewind(r *bufio.Reader) (string, error) {
-	// read binding; unused
-	if _, err := readWord(r); err != nil {
-		return "", err
-	}
-	// read state; unused
-	if _, err := readWord(r); err != nil {
-		return "", err
-	}
-	word, err := r.ReadString(';')
-	if err != nil {
-		return "", errors.New(fmt.Sprintf("failed to read next: %s", err))
-	}
-	trimmed := strings.Trim(word, ";")
-	return trimmed, nil
-}
-
-func peekEq(s string, r *bufio.Reader) (bool, error) {
-	sbar := []byte(s)
-
-	bar, err := r.Peek(len(sbar))
-	if err != nil {
-		return false, err
-	}
-
-	return bytes.Equal(sbar, bar), nil
-}
-
-func readWord(r *bufio.Reader) (string, error) {
-	for {
-		word, err := r.ReadString(' ')
-		if err != nil {
-			return "", errors.New(fmt.Sprintf("failed to read word: %s", err))
-		}
-
-		trimmed := strings.Trim(word, " ")
-		if len(trimmed) > 0 {
-		    return trimmed, nil
-		}
-	}
-
-	return "", errors.New("failed to find any word")
 }
