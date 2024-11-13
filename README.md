@@ -1,5 +1,5 @@
 # pfsense-snmpd-dhcp-extension
-Extend pfsense SNMPD to share current DHCP leases.
+Extend pfsense SNMPD to share current DHCP leases. I created this to be consumed by my CoredDNS plugin to serve SNMP data as DNS A records https://github.com/sgodbold/coredns-snmp-dhcp-plugin
 
 ```
 $ snmpwalk -v 3 -l authPriv -a SHA -A PASSWORD -u USER -x AES -X PASSWORD PFSENSE_IP:16500 nsExtendOutput1
